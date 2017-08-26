@@ -72,6 +72,19 @@
 #define BLANK_FLAG_LP	FB_BLANK_VSYNC_SUSPEND
 #define BLANK_FLAG_ULP	FB_BLANK_NORMAL
 
+#define MDSS_BRIGHT_TO_BL_DIMMER(out, v) do {\
+				out = (((v) - 2) * 255 / 250);\
+				} while (0)
+
+bool backlight_dimmer = false;
+module_param(backlight_dimmer, bool, 0755);
+
+int backlight_min = 0;
+int backlight_max = 255;
+
+module_param(backlight_min, int, 0755);
+module_param(backlight_max, int, 0755);
+
 static struct fb_info *fbi_list[MAX_FBI_LIST];
 static int fbi_list_index;
 
@@ -270,10 +283,28 @@ static void mdss_fb_set_bl_brightness(struct led_classdev *led_cdev,
 	if(!value)
 		count = 1;
 	#endif
-	/* This maps android backlight level 0 to 255 into
-	   driver backlight level 0 to bl_max with rounding */
-	MDSS_BRIGHT_TO_BL(bl_lvl, value, mfd->panel_info->bl_max,
-				mfd->panel_info->brightness_max);
+
+	// Boeffla: apply min/max limits for LCD backlight (0 is exception for display off)
+	if (value != 0)
+	{
+		if (value < backlight_min)
+			value = backlight_min;
+
+		if (value > backlight_max)
+			value = backlight_max;
+	}
+
+	if (backlight_dimmer) {
+		if (value < 3)
+			bl_lvl = 1;
+		else
+			MDSS_BRIGHT_TO_BL_DIMMER(bl_lvl, value);
+	} else {
+		/* This maps android backlight level 0 to 255 into
+		   driver backlight level 0 to bl_max with rounding */
+		MDSS_BRIGHT_TO_BL(bl_lvl, value, mfd->panel_info->bl_max,
+					mfd->panel_info->brightness_max);
+	}
 
 	if (!bl_lvl && value)
 		bl_lvl = 1;
@@ -1716,11 +1747,7 @@ static int mdss_fb_blank_sub(int blank_mode, struct fb_info *info,
 	switch (blank_mode) {
 	case FB_BLANK_UNBLANK:
 		pr_debug("unblank called. cur pwr state=%d\n", cur_power_state);
-		#ifdef VENDOR_EDIT  /*ykl add for debug lcd issue*/
-	//	printk("display power on start\n");
 		ret = mdss_fb_blank_unblank(mfd);
-	//	printk("display power on end  \n");
-		#endif
 		break;
 	case BLANK_FLAG_ULP:
 		req_power_state = MDSS_PANEL_POWER_LP2;
@@ -1754,11 +1781,7 @@ static int mdss_fb_blank_sub(int blank_mode, struct fb_info *info,
 	default:
 		req_power_state = MDSS_PANEL_POWER_OFF;
 		pr_debug("blank powerdown called\n");
-		#ifdef VENDOR_EDIT  /*ykl add for debug lcd issue*/
-		//printk("display  power off  start\n");
 		ret = mdss_fb_blank_blank(mfd, req_power_state);
-	//	printk("display  power off  end  \n");
-		#endif
 		break;
 	}
 
@@ -1918,6 +1941,8 @@ int mdss_fb_alloc_fb_ion_memory(struct msm_fb_data_type *mfd, size_t fb_size)
 
 fb_mmap_failed:
 	ion_free(mfd->fb_ion_client, mfd->fb_ion_handle);
+	mfd->fb_ion_handle = NULL;
+	mfd->fbmem_buf = NULL;
 	return rc;
 }
 
