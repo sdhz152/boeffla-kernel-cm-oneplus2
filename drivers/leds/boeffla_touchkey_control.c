@@ -18,6 +18,13 @@
 /*
  * Change log:
  *
+ * 1.3.1 (06.09.2017)
+ *	- Corrections of some pr_debug functions
+ * 
+ * 1.3.0 (30.08.2017)
+ *	- Adjust to stock handling, where by default display touch does not
+ *    light up the touchkey lights anymore
+ *
  * 1.2.0 (22.09.2016)
  *	- Change duration from seconds to milliseconds
  *
@@ -31,18 +38,15 @@
  *
  * 			/sys/class/misc/btk_control/btkc_mode
  *
- * 				0: normal mode, touch key lights controlled by rom only
- *
- * 				1: touch key buttons only - touch key lights only active
- * 					when touch keys pressed
- *
+ * 				0: touchkey and display
+ * 				1: touch key buttons only (DEFAULT)
  * 				2: Off - touch key lights are always off
  *
  *
  * 			/sys/class/misc/btk_control/btkc_timeout
  *
  * 				timeout in seconds from 1 - 30
- * 				(0 = rom is taking care of the timeout)
+ * 				(0 = rom is taking care of the timeout - DEFAULT)
  *
  *
  * 			/sys/class/misc/btk_control/btkc_version
@@ -66,8 +70,8 @@
 // Declarations
 /*****************************************/
 
-int btkc_mode    = MODE_NORMAL;		// normal mode is default
-int btkc_timeout = TIMEOUT_DEFAULT;	// default is rom controlled timeout
+int btkc_mode    = MODE_TOUCHKEY_ONLY;		// touchkey only is default
+int btkc_timeout = TIMEOUT_DEFAULT;			// default is rom controlled timeout
 
 int isScreenTouched = 0;
 int cacheBrightness = BRIGHTNESS_DEFAULT;
@@ -84,7 +88,7 @@ static DECLARE_DELAYED_WORK(led_work, led_work_func);
 
 static void led_work_func(struct work_struct *unused)
 {
-	pr_debug("Boeffla touch key control: timeout over, disable touchkey led");
+	pr_debug("Boeffla touch key control: timeout over, disable touchkey led\n");
 
 	// switch off LED and cancel any scheduled work
 	qpnp_boeffla_set_button_backlight(BRIGHTNESS_OFF);
@@ -98,12 +102,26 @@ static int lcd_notifier_callback(struct notifier_block *this,
 	switch (event)
 	{
 		case LCD_EVENT_OFF_START:
-			pr_debug("Boeffla touch key control: screen off detected, disable touchkey led");
+			pr_debug("Boeffla touch key control: screen off detected, disable touchkey led\n");
 			
 			// switch off LED and cancel any scheduled work
 			qpnp_boeffla_set_button_backlight(BRIGHTNESS_OFF);
 			cancel_delayed_work(&led_work);
 			break;
+
+		case LCD_EVENT_ON_START:
+			pr_debug("Boeffla touch key control: screen on detected\n");
+
+			// only if in touchkey+display mode, or touchkey_only but with kernel controlled
+			// timeout, switch on LED and schedule work to switch it off again
+			if ((btkc_mode == MODE_TOUCHKEY_DISP) ||
+				((btkc_mode == MODE_TOUCHKEY_ONLY) && (btkc_timeout != 0)))
+			{
+				qpnp_boeffla_set_button_backlight(cacheBrightness);
+
+				cancel_delayed_work(&led_work);
+				schedule_delayed_work(&led_work, msecs_to_jiffies(btkc_timeout));
+			}
 
 		default:
 			break;
@@ -119,17 +137,31 @@ static int lcd_notifier_callback(struct notifier_block *this,
 
 void btkc_touch_start()
 {
-	pr_debug("Boeffla touch key control: touch start detected\n");
+	pr_debug("Boeffla touch key control: display touch start detected\n");
 
 	isScreenTouched = 1;
+	
+	// only if in touchkey+display mode, switch LED on and cancel any scheduled work
+	if (btkc_mode == MODE_TOUCHKEY_DISP)
+	{
+		qpnp_boeffla_set_button_backlight(cacheBrightness);
+		cancel_delayed_work(&led_work);
+	}
 }
 
 
 void btkc_touch_stop()
 {
-	pr_debug("Boeffla touch key control: touch stop detected\n");
+	pr_debug("Boeffla touch key control: display touch stop detected\n");
 
 	isScreenTouched = 0;
+
+	// only if in touchkey+display mode, schedule work to switch it off again
+	if (btkc_mode == MODE_TOUCHKEY_DISP)
+	{
+		cancel_delayed_work(&led_work);
+		schedule_delayed_work(&led_work, msecs_to_jiffies(btkc_timeout));
+	}
 }
 
 
@@ -137,18 +169,16 @@ void btkc_touch_button()
 {
 	pr_debug("Boeffla touch key control: touch button detected\n");
 
-	// if touchkey only and rom controlled: switch on button backlight
-	if ((btkc_timeout == 0) && (btkc_mode == MODE_TOUCHKEY_ONLY))
-		qpnp_boeffla_set_button_backlight(cacheBrightness);
+	// only if in touchkey+display mode, or touchkey_only but with kernel controlled
+	// timeout, switch on LED and schedule work to switch it off again
+	if ((btkc_mode == MODE_TOUCHKEY_DISP) ||
+		((btkc_mode == MODE_TOUCHKEY_ONLY) && (btkc_timeout != 0)))
+ 	{
+ 		qpnp_boeffla_set_button_backlight(cacheBrightness);
 
-	// if touchkey only and kernel controlled: switch on button backlight and 
-	// schedule work to switch off again later
-	if ((btkc_timeout != 0) && (btkc_mode == MODE_TOUCHKEY_ONLY))
-	{
-		qpnp_boeffla_set_button_backlight(cacheBrightness);
-		cancel_delayed_work(&led_work);
-		schedule_delayed_work(&led_work, msecs_to_jiffies(btkc_timeout));
-	}
+ 		cancel_delayed_work(&led_work);
+ 		schedule_delayed_work(&led_work, msecs_to_jiffies(btkc_timeout));
+ 	}
 }
 
 
@@ -161,28 +191,11 @@ int btkc_led_set(int val)
 	if (val != BRIGHTNESS_OFF)
 		cacheBrightness = val;
 
-	// if touchkey only and kernel controlled, kernel handles everything,
-	// = make function in leds-qpnp to not do anything
-	if ((btkc_timeout != 0) && (btkc_mode == MODE_TOUCHKEY_ONLY))
+	// rom is only allowed to control LED when in touchkey_only mode
+	// and no kernel based timeout
+	if ((btkc_mode != MODE_TOUCHKEY_ONLY) || 
+		((btkc_mode == MODE_TOUCHKEY_ONLY) && (btkc_timeout != 0)))
 		return -1;
-
-	// handling based on selected mode
-	switch (btkc_mode)
-	{
-		case MODE_NORMAL:
-			// we just pass the input value back and do not influence handling at all
-			break;
-		
-		case MODE_TOUCHKEY_ONLY:
-			if ((val != BRIGHTNESS_OFF) && (isScreenTouched == 1))
-				val = -1; // make function in leds-qpnp to not do anything
-			break;
-
-		case MODE_OFF:
-			if (val != BRIGHTNESS_OFF)
-				val = -1; // make function in leds-qpnp to not do anything
-			break;
-	}
 
 	return val;
 }
@@ -210,7 +223,7 @@ static ssize_t btkc_mode_store(struct device *dev, struct device_attribute *attr
 	if (ret != 1)
 		return -EINVAL;
 
-	if ((val >= MODE_NORMAL) || (val <= MODE_OFF))
+	if ((val >= MODE_TOUCHKEY_DISP) || (val <= MODE_OFF))
 	{
 		btkc_mode = val;
 
